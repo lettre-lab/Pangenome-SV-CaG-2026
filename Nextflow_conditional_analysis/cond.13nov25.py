@@ -1,0 +1,170 @@
+# Script made by Cristian Groza
+# Adapted by Rose Laflamme
+
+import bed_reader
+import zstandard as zstd
+import sys
+import numpy
+import pandas
+from sklearn import linear_model
+from sklearn.metrics.pairwise import cosine_similarity
+from scipy.stats import linregress
+import statsmodels.api as sm
+
+
+bed_path  = sys.argv[1]
+qtl_path  = sys.argv[2]
+chrom     = sys.argv[3]
+cis_chrom = sys.argv[4]
+
+pheno = sys.argv[5]
+pheno_path = sys.argv[6]
+
+covar_path = sys.argv[7]
+
+cis_pval = 5.0e-8 ###
+trans_pval = 1.0e-6 ###
+
+pval_threshold = 5.0e-8 ###
+
+if cis_chrom == chrom:
+    pval_threshold = 5.0e-8
+
+bed = bed_reader.open_bed(bed_path)
+
+snps = [] 
+
+with zstd.open(qtl_path, 'r') as qtl_file:
+    fields = qtl_file.readline().rstrip().split()
+
+    for line in qtl_file:
+        snp = dict(zip(fields, line.split()))
+
+        if snp["#CHROM"] != chrom:
+            continue
+
+        if snp["P"] == "NA":
+            continue
+            
+        if snp["TEST"] != "ADD": # keep only ADD rows
+            continue
+
+        if snp["#CHROM"] == cis_chrom and float(snp["P"]) < cis_pval:
+            snps.append(snp)
+
+        elif snp["#CHROM"] != cis_chrom and float(snp["P"]) < trans_pval:
+            snps.append(snp)
+
+snps.sort(key = lambda x: float(x["P"]))
+
+# load genotypes
+snp_indices = [numpy.nonzero(bed.sid == snp["ID"])[0][0] for snp in snps]
+sample_indices = [numpy.nonzero(bed.iid == sample)[0][0].item() for sample in bed.iid]
+bed_data = pandas.DataFrame(bed.read((sample_indices, snp_indices)))
+bed_data = bed_data.set_axis([snp["ID"] for snp in snps], axis=1)
+bed_data = bed_data.assign(IID = bed.iid)
+
+pheno_values = None
+
+# load pheno measurements
+with open(pheno_path, 'r') as pheno_file:
+    pheno_dict = {}
+    fields = pheno_file.readline().rstrip().split()
+    for line in pheno_file:
+        pheno_record = dict(zip(fields, line.split()))
+        pheno_dict[pheno_record["IID"]] = pheno_record[pheno]
+    pheno_values = numpy.array([pheno_dict[sample] for sample in bed.iid])
+
+# load covariates
+df = pandas.read_csv(covar_path, sep='\t', header=0)
+df['IID'] = df['IID'].astype(str).str.strip() # added that
+df['IID'] = pandas.Categorical(df['IID'], categories=bed.iid, ordered=True)
+df.sort_values(by='IID', inplace=True)
+
+df = df.assign(pheno=pheno_values)
+df['pheno'] = pandas.to_numeric(df['pheno'], errors='coerce')
+
+pheno_geno_df = pandas.merge(df, bed_data, on='IID', how='inner')
+
+sig_snps = snps.copy()
+
+covariates = ["AGE","SEX","PC1","PC2","PC3","PC4",
+              "PC5","PC6","PC7","PC8","PC9","PC10",
+              "PEER1","PEER2","PEER3","PEER4","PEER5","PEER6","PEER7","PEER8","PEER9","PEER10",
+              "PEER11","PEER12","PEER13","PEER14","PEER15","PEER16","PEER17","PEER18","PEER19","PEER20",
+              "PEER21","PEER22","PEER23","PEER24","PEER25","PEER26","PEER27","PEER28","PEER29","PEER30",
+              "PEER31","PEER32","PEER33","PEER34","PEER35","PEER36","PEER37","PEER38","PEER39","PEER40",
+              "PEER41","PEER42","PEER43","PEER44","PEER45","PEER46","PEER47","PEER48","PEER49","PEER50",
+              "PEER51","PEER52","PEER53","PEER54","PEER55","PEER56","PEER57","PEER58","PEER59","PEER60"]
+
+output_snps = []
+
+while sig_snps:
+    top_snp = sig_snps[0]
+    if 'COND_J' not in top_snp:
+        top_snp['SE_J']  = top_snp['SE']
+        top_snp['BETA_J']  = top_snp['BETA']
+        top_snp['P_J']  = top_snp['P']
+        top_snp['COND_J']  = '.'
+        top_snp['COS_J']  = '.'
+
+    output_snps.append(top_snp.copy())
+
+    new_sig_snps = []
+
+    for snp in sig_snps[1:]:
+        # don't condition on SNPs that are more than 10 MBp away
+        if abs(int(snp['POS']) - int(top_snp['POS'])) > 1e7:
+            if 'COND_J' not in snp:
+                snp['SE_J']  = snp['SE']
+                snp['BETA_J']  = snp['BETA']
+                snp['P_J'] = snp['P']
+                snp['COND_J']  = "."
+                snp['COS_J']  = "."
+            new_sig_snps.append(snp)
+            continue
+
+        # skip SNPs that are colinear
+        
+        x = pheno_geno_df.loc[:, ["IID", top_snp['ID']]]
+        y = pheno_geno_df.loc[:, ["IID", snp['ID']]]
+        x.dropna(inplace=True)
+        y.dropna(inplace=True)
+        
+        common_iid = set(x["IID"]) & set(y["IID"])
+        
+        x = x[x["IID"].isin(common_iid)]
+        y = y[y["IID"].isin(common_iid)]
+        
+        x = x.loc[:, top_snp['ID']]
+        y = y.loc[:, snp['ID']]
+
+        similarity = cosine_similarity(x.values.reshape(1, -1), y.values.reshape(1, -1))[0][0]
+                                                                   
+        if similarity > 0.99:
+            continue
+
+        # regress conditioning on the top SNP
+        X = pheno_geno_df.loc[:, ['pheno', top_snp['ID'], snp['ID']] + covariates]
+        X.dropna(inplace=True)
+
+        model = sm.OLS(X['pheno'], X.loc[:, [top_snp['ID'], snp['ID']] + covariates]).fit()
+
+        snp = snp.copy()
+
+        snp['SE_J'] = model.bse[snp['ID']]
+        snp['BETA_J'] = model.params[snp['ID']]
+        snp['P_J'] = model.pvalues[snp['ID']]
+        snp['COND_J'] = top_snp['ID']
+        snp['COS_J'] = similarity
+
+        if model.pvalues[snp['ID']] < pval_threshold: 
+            new_sig_snps.append(snp)
+        else:
+            output_snps.append(snp.copy())
+
+    sig_snps = new_sig_snps
+    # resort by adjusted P-value
+    sig_snps.sort(key = lambda x: float(x["P_J"]))
+
+pandas.DataFrame.from_dict(output_snps).to_csv(sys.stdout, index=False, sep = "\t")
